@@ -8,6 +8,7 @@ static char buf[4096] = "Hello, world!";
 
 int main(void)
 {
+  const int on = 1;
   int sockfd, client_fd;
   struct sockaddr_in server_addr;
   struct sockaddr client_addr;
@@ -24,6 +25,11 @@ int main(void)
   server_addr.sin_port = htons(8080);
   if (inet_pton(AF_INET, "0.0.0.0", &server_addr.sin_addr) != 1) {
     perror("inet_pton");
+    return -1;
+  }
+
+  if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0) {
+    perror("setsockopt");
     return -1;
   }
 

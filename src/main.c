@@ -42,21 +42,14 @@ struct udp_record
 # error "RAND_MAX is unexpected and unsupported, please fix it manually."
 #endif
 
-enum
-{
-  LTE_DOWNLINK = 1,
-  LTE_UPLINK   = 2,
-};
-
 static int sk_snd_client, sk_snd_server;
 static int sk_rcv_client, sk_rcv_server;
 static struct sockaddr_in client_addr, server_addr;
 
-static struct list_head net_ul_list;
+static struct list_head net_ul_list, net_dl_list;
 static struct list_head lte_ul_list, lte_dl_list;
 static size_t lte_tokens;
-static int lte_state;
-static uint64_t lte_state_stamp;
+static uint64_t lte_ul_stamp;
 
 static struct udp_record udp_records[MAX_UDP_RECORDS], *curr_udp_record;
 static int64_t udp_stamp_offset;
@@ -182,28 +175,28 @@ static int process_server_tx(void)
 
   while ((pkt = sk_recv(sk_rcv_server)))
   {
-    if (!list_empty(&lte_dl_list)) {
+    if (!list_empty(&net_dl_list)) {
       struct packet *last_pkt;
       uint64_t ts_delta;
-      last_pkt = list_last_entry(&lte_dl_list, struct packet, node);
+      last_pkt = list_last_entry(&net_dl_list, struct packet, node);
       ts_delta = pkt->tx_stamp - last_pkt->tx_stamp;
-  
+
       ts_min = last_pkt->rx_stamp + ts_delta / 2;
       ts_max = last_pkt->rx_stamp + ts_delta * 2;
     } else {
       ts_min = 0;
       ts_max = ~0ull;
     }
-  
+
     ts_new = pkt->tx_stamp;
-    ts_new += 45 + __builtin_popcount(rand() & 0x3fffffff);
+    ts_new += 35 + __builtin_popcount(rand() & 0x7);
     if (ts_new < ts_min)
       ts_new = ts_min;
     if (ts_new > ts_max)
       ts_new = ts_max;
     pkt->rx_stamp = ts_new;
-  
-    list_add_tail(&pkt->node, &lte_dl_list);
+
+    list_add_tail(&pkt->node, &net_dl_list);
     ++cnt;
   }
 
@@ -230,22 +223,39 @@ static int process_server_rx(void)
   return cnt;
 }
 
-static void drop_lte_buffer(uint64_t ts)
+static void drop_lte_buffer(void)
 {
-  struct packet *pkt;
-
-  while ((pkt = list_first_entry_or_null(&lte_dl_list, struct packet, node)))
+  while (!list_empty(&lte_dl_list))
   {
-    if (pkt->rx_stamp > ts)
-      break;
+    struct packet *pkt;
+    pkt = list_first_entry(&lte_dl_list, struct packet, node);
     list_del(&pkt->node);
     free(pkt);
   }
 }
 
-static int process_lte_dl(void)
+static int process_lte_buffer(void)
 {
   uint64_t ts = current_timestamp();
+  int cnt = 0;
+
+  while (!list_empty(&net_dl_list))
+  {
+    struct packet *pkt;
+    pkt = list_first_entry(&net_dl_list, struct packet, node);
+    if (pkt->rx_stamp > ts)
+      break;
+
+    list_del(&pkt->node);
+    list_add_tail(&pkt->node, &lte_dl_list);
+    ++cnt;
+  }
+
+  return cnt;
+}
+
+static int process_lte_dl(void)
+{
   int cnt = 0;
 
   while (!list_empty(&lte_dl_list))
@@ -253,8 +263,6 @@ static int process_lte_dl(void)
     struct packet *pkt;
     pkt = list_first_entry(&lte_dl_list, struct packet, node);
     if (pkt->length > lte_tokens)
-      break;
-    if (pkt->rx_stamp > ts)
       break;
 
     lte_tokens -= pkt->length;
@@ -284,9 +292,9 @@ static int process_lte_ul_rsp(void)
 {
   uint64_t ts = current_timestamp();
   uint64_t ts_min, ts_max, ts_new;
-  int cnt = 0;
+  int cnt = 0, max_cnt = 3 + rand() % 10;
 
-  while (!list_empty(&lte_ul_list))
+  while (!list_empty(&lte_ul_list) && cnt < max_cnt)
   {
     struct packet *pkt;
     pkt = list_first_entry(&lte_ul_list, struct packet, node);
@@ -302,25 +310,30 @@ static int process_lte_ul_rsp(void)
       uint64_t ts_delta;
       last_pkt = list_last_entry(&net_ul_list, struct packet, node);
       ts_delta = pkt->tx_stamp - last_pkt->tx_stamp;
-  
+
       ts_min = last_pkt->rx_stamp + ts_delta / 2;
       ts_max = last_pkt->rx_stamp + ts_delta * 2;
     } else {
       ts_min = 0;
       ts_max = ~0ull;
     }
-  
+
     ts_new = pkt->tx_stamp;
-    ts_new += 45 + __builtin_popcount(rand() & 0x3fffffff);
+    ts_new += 35 + __builtin_popcount(rand() & 0x7);
     if (ts_new < ts_min)
       ts_new = ts_min;
     if (ts_new > ts_max)
       ts_new = ts_max;
     pkt->rx_stamp = ts_new;
-  
+
     list_add_tail(&pkt->node, &net_ul_list);
     ++cnt;
   }
+
+  if (!list_empty(&lte_ul_list))
+    lte_ul_stamp = ts + rand() % 10;
+  else
+    lte_ul_stamp = ~0ull;
 
   return cnt;
 }
@@ -328,21 +341,17 @@ static int process_lte_ul_rsp(void)
 static int process_lte(void)
 {
   uint64_t ts, udp_ts;
+  int cnt = 0;
 
   process_lte_ul_req();
+  process_lte_buffer();
 
   ts = current_timestamp();
   udp_ts = ts + udp_stamp_offset;
-  if (!list_empty(&lte_ul_list) &&
-      lte_state == LTE_DOWNLINK && !~lte_state_stamp)
-    lte_state_stamp = udp_ts + 5 + (rand() % 5);
-  if (udp_ts >= curr_udp_record->timestamp + 20)
+  if (!list_empty(&lte_ul_list) && !~lte_ul_stamp)
+    lte_ul_stamp = ts + rand() % 60;
+  if (udp_ts >= curr_udp_record->timestamp + 2)
     lte_tokens = 0;
-  if (lte_state == LTE_UPLINK && lte_state_stamp < udp_ts) {
-    lte_state = LTE_DOWNLINK;
-    lte_state_stamp = ~0ull;
-    lte_tokens = 0;
-  }
 
   while (curr_udp_record[1].timestamp <= udp_ts)
   {
@@ -352,20 +361,20 @@ static int process_lte(void)
     next = curr + 1;
     ts_delta = next->timestamp - curr->timestamp;
 
-    if (ts_delta >= 100 && !(rand() & 7))
-      drop_lte_buffer(next->timestamp - udp_stamp_offset);
-    if (lte_state == LTE_DOWNLINK && lte_state_stamp <= next->timestamp) {
-      lte_state = LTE_UPLINK;
-      lte_state_stamp = next->timestamp + 1;
-      lte_tokens = 0;
-    }
+    if (ts_delta >= 100 && !(rand() & 3))
+      drop_lte_buffer();
     lte_tokens += next->length;
     curr_udp_record = next;
   }
-  if (lte_tokens >= 6144)
-    lte_tokens = 6144;
 
-  return lte_state == LTE_UPLINK ? process_lte_ul_rsp() : process_lte_dl();
+  if (lte_ul_stamp <= ts) {
+    cnt += process_lte_ul_rsp();
+    if (lte_ul_stamp < curr_udp_record->timestamp && !(rand() & 3))
+      lte_ul_stamp = curr_udp_record->timestamp;
+  }
+  cnt += process_lte_dl();
+
+  return cnt;
 }
 
 static void read_udp_records(void)
@@ -378,7 +387,7 @@ static void read_udp_records(void)
   struct udp_record *record = udp_records;
 
   func = "fopen";
-  fp = fopen("/tmp/udp/xat", "r");
+  fp = fopen("/tmp/udp/xac", "r");
   if (!fp)
     goto fail;
 
@@ -429,13 +438,13 @@ int main(void)
   sk_snd_server = sk_snd_open(SERVER_INTERFACE);
 
   INIT_LIST_HEAD(&net_ul_list);
+  INIT_LIST_HEAD(&net_dl_list);
   INIT_LIST_HEAD(&lte_ul_list);
   INIT_LIST_HEAD(&lte_dl_list);
 
   read_udp_records();
   curr_udp_record = &udp_records[3];
-  lte_state = LTE_DOWNLINK;
-  lte_state_stamp = ~0ull;
+  lte_ul_stamp = ~0ull;
 
   while (process_lte_ul_req() == 0)
     sched_yield();
